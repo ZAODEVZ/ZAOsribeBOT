@@ -1,0 +1,48 @@
+# dependencies
+node_modules/
+.pnp.*
+.yarn/
+
+# build
+dist/
+*.tsbuildinfo
+
+# env + secrets
+.env
+.env.local
+.env.production
+.env.development
+.envrc
+*.pem
+*.key
+secrets/
+
+# recordings (PII - never commit)
+recordings/
+*.wav
+*.flac
+*.mp3
+*.opus
+*.ogg
+*.m4a
+*.mp4
+*.mov
+**/.zao-private/
+
+# logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# transcripts (PII - off-repo per .claude/rules/pii-hygiene.md)
+*.transcript.json
+*.transcript.txt
+transcripts/
