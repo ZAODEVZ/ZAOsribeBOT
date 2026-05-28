@@ -21,6 +21,46 @@ import { shortHash } from '../util/hash.js';
 const activeSessions = new Map<string, { recorder: VoiceRecorder; session: RecordingSession }>();
 const recentStops = new Map<string, number>();
 const START_COOLDOWN_MS = 5_000;
+const RECENT_STOPS_TTL_MS = 60_000;
+
+function pruneRecentStops(): void {
+  const cutoff = Date.now() - RECENT_STOPS_TTL_MS;
+  for (const [guildId, ts] of recentStops) {
+    if (ts < cutoff) recentStops.delete(guildId);
+  }
+}
+
+/**
+ * Stop every active recording, finalize the session, and run postprocess so
+ * the on-disk layout matches what the /meeting pipeline expects. Called from
+ * the SIGINT/SIGTERM handler so a systemd restart never leaves orphaned half-
+ * recordings. The webhook handoff is intentionally skipped here because the
+ * receiver may also be going down at the same time; the session folder is
+ * complete on disk and can be re-handed-off later via the manual /meeting
+ * skill if needed.
+ */
+export async function finalizeAllActiveSessions(): Promise<void> {
+  if (activeSessions.size === 0) return;
+  logger.warn({ active: activeSessions.size }, 'shutdown:finalizing active recordings');
+  const entries = Array.from(activeSessions.entries());
+  activeSessions.clear();
+  for (const [guildId, { recorder, session }] of entries) {
+    try {
+      await recorder.stop();
+      await session.finalize('shutdown:auto-finalized');
+      await postprocessSession(session);
+      logger.info(
+        { guildId, sessionId: shortHash(session.id), folder: session.folder },
+        'shutdown:session-finalized',
+      );
+    } catch (err) {
+      logger.error(
+        { err, guildId, sessionId: shortHash(session.id) },
+        'shutdown:finalize failed',
+      );
+    }
+  }
+}
 
 export const SLASH_COMMANDS = [
   {
@@ -136,6 +176,7 @@ async function handleStart(interaction: ChatInputCommandInteraction): Promise<vo
     return;
   }
 
+  pruneRecentStops();
   const lastStop = recentStops.get(interaction.guild.id);
   if (lastStop && Date.now() - lastStop < START_COOLDOWN_MS) {
     const wait = Math.ceil((START_COOLDOWN_MS - (Date.now() - lastStop)) / 1000);

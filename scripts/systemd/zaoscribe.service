@@ -12,6 +12,10 @@ EnvironmentFile=/opt/zaoscribe/.env
 ExecStart=/usr/bin/node --import tsx /opt/zaoscribe/src/index.ts
 Restart=on-failure
 RestartSec=5s
+# Match the FINALIZE_DEADLINE_MS in src/index.ts so systemd waits for the
+# graceful shutdown to flush in-flight recordings before SIGKILL.
+TimeoutStopSec=35s
+KillSignal=SIGTERM
 StandardOutput=journal
 StandardError=journal
 
