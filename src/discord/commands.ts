@@ -16,7 +16,9 @@ import {
 } from '../postprocess.js';
 import { VoiceRecorder } from '../recorder.js';
 import { RecordingSession } from '../session.js';
+import { checkRecordingsQuota, humanBytes } from '../util/diskQuota.js';
 import { shortHash } from '../util/hash.js';
+import { VPS_SLASH_COMMAND, handleVpsCommand } from './vps.js';
 
 const activeSessions = new Map<string, { recorder: VoiceRecorder; session: RecordingSession }>();
 const recentStops = new Map<string, number>();
@@ -92,6 +94,7 @@ export const SLASH_COMMANDS = [
       },
     ],
   },
+  VPS_SLASH_COMMAND,
 ] as const;
 
 /**
@@ -142,12 +145,30 @@ async function postChannelConsentBanner(
   }
 }
 
+async function fetchMemberWithTimeout(
+  interaction: ChatInputCommandInteraction,
+  userId: string,
+): Promise<GuildMember | null> {
+  if (!interaction.guild) return null;
+  return Promise.race([
+    interaction.guild.members.fetch(userId).catch(() => null),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 5_000)),
+  ]);
+}
+
 async function handleStart(interaction: ChatInputCommandInteraction): Promise<void> {
   if (!interaction.guild || !interaction.member) {
     await interaction.reply({ content: 'ZAOscribe only works inside a server.', ephemeral: true });
     return;
   }
-  const member = await interaction.guild.members.fetch(interaction.user.id);
+  const member = await fetchMemberWithTimeout(interaction, interaction.user.id);
+  if (!member) {
+    await interaction.reply({
+      content: 'Could not resolve your guild membership in time. Try again.',
+      ephemeral: true,
+    });
+    return;
+  }
   if (!isAuthorized(member)) {
     await interaction.reply({
       content:
@@ -187,6 +208,18 @@ async function handleStart(interaction: ChatInputCommandInteraction): Promise<vo
     return;
   }
 
+  const quota = await checkRecordingsQuota();
+  if (quota.overCap) {
+    await interaction.reply({
+      content:
+        `Recordings disk quota exceeded: ${humanBytes(quota.bytesUsed)} / ${humanBytes(quota.capBytes)}. ` +
+        'Ops must clean recordings or raise MAX_RECORDINGS_BYTES before recording resumes.',
+      ephemeral: true,
+    });
+    logger.warn({ ...quota }, 'discord:quota-blocked-start');
+    return;
+  }
+
   await interaction.deferReply();
 
   const session = new RecordingSession({
@@ -216,8 +249,8 @@ async function handleStop(interaction: ChatInputCommandInteraction): Promise<voi
     await interaction.reply({ content: 'ZAOscribe only works inside a server.', ephemeral: true });
     return;
   }
-  const member = await interaction.guild.members.fetch(interaction.user.id);
-  if (!isAuthorized(member)) {
+  const member = await fetchMemberWithTimeout(interaction, interaction.user.id);
+  if (!member || !isAuthorized(member)) {
     await interaction.reply({ content: 'You are not authorized to stop ZAOscribe.', ephemeral: true });
     return;
   }
@@ -290,13 +323,20 @@ async function handleStop(interaction: ChatInputCommandInteraction): Promise<voi
     },
   );
 
+  const totalBytes = stems.reduce((a, b) => a + b.bytes, 0);
+
   const summaryLines = [
     `**Session** \`${session.id}\``,
     `**Stems** ${stems.length} captured${failedStems > 0 ? `, ${failedStems} failed encode` : ''} - mixed to \`${mixPath || 'n/a'}\``,
-    `**Folder** \`${session.folder}\``,
+    `**Folder** \`${session.folder}\` (${humanBytes(totalBytes)})`,
     `**Duration** ${session.meta.durationMs ? `${Math.round(session.meta.durationMs / 1000)}s` : 'n/a'}`,
     `**Pipeline handoff** ${webhookResult.ok ? 'OK' : webhookResult.body ? `failed (${webhookResult.body})` : 'not configured'}`,
   ];
+
+  logger.info(
+    { sessionId: shortHash(session.id), stems: stems.length, failedStems, totalBytes, webhookOk: webhookResult.ok },
+    'discord:session-complete',
+  );
 
   await interaction.followUp({ content: summaryLines.join('\n'), ephemeral: false });
 }
@@ -325,14 +365,19 @@ async function handleStatus(interaction: ChatInputCommandInteraction): Promise<v
 export function registerCommandHandlers(client: Client): void {
   client.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
-    if (interaction.commandName !== 'scribe') return;
-    const sub = interaction.options.getSubcommand();
+    const cmd = interaction.commandName;
+    if (cmd !== 'scribe' && cmd !== 'vps') return;
+    const sub = interaction.options.getSubcommand(false) ?? '';
     try {
-      if (sub === 'start') await handleStart(interaction);
-      else if (sub === 'stop') await handleStop(interaction);
-      else if (sub === 'status') await handleStatus(interaction);
+      if (cmd === 'scribe') {
+        if (sub === 'start') await handleStart(interaction);
+        else if (sub === 'stop') await handleStop(interaction);
+        else if (sub === 'status') await handleStatus(interaction);
+      } else if (cmd === 'vps') {
+        await handleVpsCommand(interaction);
+      }
     } catch (err) {
-      logger.error({ err, sub }, 'discord:handler error');
+      logger.error({ err, cmd, sub }, 'discord:handler error');
       const errorMsg = err instanceof Error ? err.message : 'Unknown error';
       if (interaction.replied || interaction.deferred) {
         await interaction.followUp({ content: `Error: ${errorMsg}`, ephemeral: true }).catch(() => {});
