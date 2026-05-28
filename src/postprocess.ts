@@ -1,8 +1,10 @@
 import { spawn } from 'node:child_process';
+import { rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { logger } from './logger.js';
 import { RECORDER_AUDIO_FORMAT } from './recorder.js';
 import type { RecordingSession } from './session.js';
+import { hmacSign, shortHash } from './util/hash.js';
 
 /**
  * Convert raw PCM stem to a WAV file. Craig-style per-user audio: one WAV per
@@ -48,10 +50,23 @@ function mixStems(stemWavs: string[], outPath: string): Promise<void> {
       return;
     }
     const inputs = stemWavs.flatMap((p) => ['-i', p]);
-    const filter =
-      stemWavs.map((_, i) => `[${i}:a]`).join('') +
-      `amix=inputs=${stemWavs.length}:duration=longest:normalize=0,loudnorm=I=-16:TP=-1.5[a]`;
-    const args = ['-y', ...inputs, '-filter_complex', filter, '-map', '[a]', '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', outPath];
+    const inputLabels = stemWavs.map((_, i) => `[${i}:a]`).join('');
+    const filter = `${inputLabels}amix=inputs=${stemWavs.length}:duration=longest:normalize=0,loudnorm=I=-16:TP=-1.5[a]`;
+    const args = [
+      '-y',
+      ...inputs,
+      '-filter_complex',
+      filter,
+      '-map',
+      '[a]',
+      '-ar',
+      '16000',
+      '-ac',
+      '1',
+      '-c:a',
+      'pcm_s16le',
+      outPath,
+    ];
     const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
     let stderr = '';
     proc.stderr.on('data', (chunk) => {
@@ -65,72 +80,157 @@ function mixStems(stemWavs: string[], outPath: string): Promise<void> {
   });
 }
 
+async function fileSizeOr(path: string): Promise<number> {
+  try {
+    const s = await stat(path);
+    return s.size;
+  } catch {
+    return -1;
+  }
+}
+
 export interface PostprocessResult {
   stemWavs: string[];
   mixPath: string;
+  failedStems: number;
 }
 
 export async function postprocessSession(session: RecordingSession): Promise<PostprocessResult> {
   const stemWavs: string[] = [];
+  let failedStems = 0;
 
   for (const participant of Object.values(session.meta.participants)) {
     const pcmPath = join(session.folder, participant.stemFilename);
+    const pcmSize = await fileSizeOr(pcmPath);
+    if (pcmSize <= 0) {
+      logger.warn(
+        {
+          sessionId: shortHash(session.id),
+          userHash: shortHash(participant.userId),
+          pcmPath,
+          pcmSize,
+        },
+        'postprocess:pcm-missing-or-empty',
+      );
+      failedStems += 1;
+      continue;
+    }
+
     const wavName = participant.stemFilename.replace(/\.pcm$/, '.wav');
     const wavPath = join(session.folder, wavName);
     try {
       await pcmToWav(pcmPath, wavPath);
+      const wavSize = await fileSizeOr(wavPath);
+      if (wavSize <= 0) {
+        logger.warn(
+          { sessionId: shortHash(session.id), wavPath },
+          'postprocess:wav-empty-after-encode',
+        );
+        failedStems += 1;
+        continue;
+      }
       stemWavs.push(wavPath);
-      // Keep the pcm too (cheap insurance); rename participant ref to wav.
       participant.stemFilename = wavName;
     } catch (err) {
-      logger.error({ err, userId: participant.userId, pcmPath }, 'postprocess:pcm2wav failed');
+      logger.error(
+        {
+          err,
+          sessionId: shortHash(session.id),
+          userHash: shortHash(participant.userId),
+          pcmPath,
+        },
+        'postprocess:pcm2wav failed',
+      );
+      failedStems += 1;
     }
   }
+
+  // Re-persist meta.json so the on-disk record matches the renamed wavs. A
+  // crash after this point still recovers; before this point would have left
+  // stale .pcm references.
+  await session.persist();
 
   const mixPath = join(session.folder, 'mix.wav');
   if (stemWavs.length > 0) {
     try {
       await mixStems(stemWavs, mixPath);
+      const mixSize = await fileSizeOr(mixPath);
+      if (mixSize <= 0) {
+        logger.warn({ sessionId: shortHash(session.id), mixPath }, 'postprocess:mix-empty');
+      }
     } catch (err) {
-      logger.error({ err }, 'postprocess:mix failed');
+      logger.error({ err, sessionId: shortHash(session.id) }, 'postprocess:mix failed');
     }
+  } else {
+    logger.warn({ sessionId: shortHash(session.id) }, 'postprocess:no stems to mix');
   }
 
-  logger.info({ sessionId: session.id, stems: stemWavs.length, mixPath }, 'postprocess:done');
-  return { stemWavs, mixPath };
+  logger.info(
+    { sessionId: shortHash(session.id), stems: stemWavs.length, failedStems, mixPath },
+    'postprocess:done',
+  );
+  return { stemWavs, mixPath, failedStems };
 }
 
+export async function cleanupSessionFolder(session: RecordingSession): Promise<void> {
+  try {
+    await rm(session.folder, { recursive: true, force: true });
+    logger.info({ sessionId: shortHash(session.id) }, 'postprocess:cleanup ok');
+  } catch (err) {
+    logger.error({ err, sessionId: shortHash(session.id) }, 'postprocess:cleanup failed');
+  }
+}
+
+export interface WebhookPayload {
+  sessionId: string;
+  source: string;
+  folder: string;
+  mixPath: string;
+  stemWavs: string[];
+  participants: Record<string, { userId: string; usernameHash: string }>;
+  startedAt: string;
+  endedAt?: string;
+  channelName?: string;
+}
+
+/**
+ * POST the session handoff to the configured webhook (typically Zaal's mac
+ * running the /meeting pipeline). Signature scheme matches GitHub-style HMAC:
+ *
+ *   x-zaoscribe-timestamp: <epoch ms>
+ *   x-zaoscribe-signature: sha256=<hmac-sha256(secret, `${ts}.${body}`)>
+ *
+ * Receiver verifies timestamp recency (<= 5min) + constant-time compares the
+ * signature before processing. Best-effort; never throws.
+ */
 export async function notifyTranscribeWebhook(
   webhookUrl: string,
   webhookSecret: string,
-  payload: {
-    sessionId: string;
-    source: string;
-    folder: string;
-    mixPath: string;
-    stemWavs: string[];
-    participants: Record<string, { userId: string; username: string; displayName: string }>;
-    startedAt: string;
-    endedAt?: string;
-    channelName?: string;
-  },
+  payload: WebhookPayload,
 ): Promise<{ ok: boolean; status?: number; body?: string }> {
   if (!webhookUrl) return { ok: false, status: 0, body: 'no webhook configured' };
+
+  const rawBody = JSON.stringify(payload);
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+
+  if (webhookSecret) {
+    const timestamp = Date.now().toString();
+    headers['x-zaoscribe-timestamp'] = timestamp;
+    headers['x-zaoscribe-signature'] = `sha256=${hmacSign(webhookSecret, timestamp, rawBody)}`;
+  }
+
   try {
     const res = await fetch(webhookUrl, {
       method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(webhookSecret ? { authorization: `Bearer ${webhookSecret}` } : {}),
-      },
-      body: JSON.stringify(payload),
+      headers,
+      body: rawBody,
       signal: AbortSignal.timeout(15_000),
     });
     const body = await res.text();
     return { ok: res.ok, status: res.status, body: body.slice(0, 500) };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    logger.warn({ err: msg }, 'postprocess:webhook failed');
+    logger.warn({ err: msg, sessionId: shortHash(payload.sessionId) }, 'postprocess:webhook failed');
     return { ok: false, body: msg };
   }
 }

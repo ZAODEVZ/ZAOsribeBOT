@@ -1,5 +1,6 @@
 import { createWriteStream, type WriteStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
+import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import {
   type AudioReceiveStream,
@@ -11,14 +12,17 @@ import type { VoiceBasedChannel } from 'discord.js';
 import prism from 'prism-media';
 import { logger } from './logger.js';
 import type { RecordingSession } from './session.js';
+import { shortHash } from './util/hash.js';
 
 const SAMPLE_RATE = 48_000;
 const CHANNELS = 2;
+const PIPELINE_DRAIN_TIMEOUT_MS = 5_000;
 
 interface ActiveUserStream {
   receiveStream: AudioReceiveStream;
   decoder: prism.opus.Decoder;
   fileStream: WriteStream;
+  pipelinePromise: Promise<void>;
   closed: boolean;
 }
 
@@ -46,12 +50,18 @@ export class VoiceRecorder {
     const receiver = this.connection.receiver;
     receiver.speaking.on('start', (userId) => {
       this.handleSpeakingStart(userId).catch((err) => {
-        logger.error({ err, userId }, 'recorder:speaking-start error');
+        logger.error(
+          { err, sessionId: shortHash(this.session.id), userHash: shortHash(userId) },
+          'recorder:speaking-start error',
+        );
       });
     });
 
     logger.info(
-      { sessionId: this.session.id, channelId: this.channel.id, channelName: this.channelName },
+      {
+        sessionId: shortHash(this.session.id),
+        channelId: this.channel.id,
+      },
       'recorder:start',
     );
   }
@@ -73,18 +83,38 @@ export class VoiceRecorder {
       channels: CHANNELS,
       frameSize: 960,
     });
-    const pcmPath = `${this.session.folder}/${participant.stemFilename}`;
+    const pcmPath = join(this.session.folder, participant.stemFilename);
     const fileStream = createWriteStream(pcmPath, { flags: 'a' });
 
-    const entry: ActiveUserStream = { receiveStream, decoder, fileStream, closed: false };
-    this.userStreams.set(userId, entry);
-
-    pipeline(receiveStream, decoder, fileStream).catch((err) => {
-      if (entry.closed) return;
-      logger.error({ err, userId }, 'recorder:pipeline error');
+    const pipelinePromise = pipeline(receiveStream, decoder, fileStream).catch((err) => {
+      // If we're already shutting this stream down on /scribe stop, swallow the
+      // expected post-destroy error. Otherwise log it so silent failures don't
+      // mask real I/O bugs.
+      const entry = this.userStreams.get(userId);
+      if (entry?.closed) return;
+      logger.error(
+        { err, sessionId: shortHash(this.session.id), userHash: shortHash(userId) },
+        'recorder:pipeline error',
+      );
     });
 
-    logger.info({ userId, username, pcmPath }, 'recorder:user-stream-started');
+    const entry: ActiveUserStream = {
+      receiveStream,
+      decoder,
+      fileStream,
+      pipelinePromise,
+      closed: false,
+    };
+    this.userStreams.set(userId, entry);
+
+    logger.info(
+      {
+        sessionId: shortHash(this.session.id),
+        userHash: shortHash(userId),
+        stemFilename: participant.stemFilename,
+      },
+      'recorder:user-stream-started',
+    );
   }
 
   async stop(): Promise<{ stems: Array<{ userId: string; pcmPath: string; bytes: number }> }> {
@@ -95,22 +125,50 @@ export class VoiceRecorder {
       try {
         entry.receiveStream.destroy();
       } catch (err) {
-        logger.warn({ err, userId }, 'recorder:receiveStream destroy failed');
+        logger.warn(
+          { err, userHash: shortHash(userId) },
+          'recorder:receiveStream destroy failed',
+        );
       }
       try {
         entry.decoder.end();
       } catch (err) {
-        logger.warn({ err, userId }, 'recorder:decoder end failed');
+        logger.warn({ err, userHash: shortHash(userId) }, 'recorder:decoder end failed');
       }
+
+      // Wait for the pipeline to drain so the file stream's buffer is flushed
+      // before we declare the stem complete. Cap wait so a stuck stream cannot
+      // hang /scribe stop forever.
+      await Promise.race([
+        entry.pipelinePromise,
+        new Promise<void>((resolve) => setTimeout(resolve, PIPELINE_DRAIN_TIMEOUT_MS)),
+      ]);
+
       await new Promise<void>((resolve) => {
+        if (entry.fileStream.closed) {
+          resolve();
+          return;
+        }
         entry.fileStream.end(() => resolve());
       });
-      const pcmPath = `${this.session.folder}/${this.session.meta.participants[userId]?.stemFilename ?? ''}`;
-      try {
-        const s = await stat(pcmPath);
-        stems.push({ userId, pcmPath, bytes: s.size });
-      } catch {
-        // file missing - skip
+
+      const stemFilename = this.session.meta.participants[userId]?.stemFilename;
+      if (stemFilename) {
+        const pcmPath = join(this.session.folder, stemFilename);
+        try {
+          const s = await stat(pcmPath);
+          if (s.size > 0) stems.push({ userId, pcmPath, bytes: s.size });
+          else
+            logger.warn(
+              { sessionId: shortHash(this.session.id), userHash: shortHash(userId), pcmPath },
+              'recorder:stem empty - dropped',
+            );
+        } catch (err) {
+          logger.warn(
+            { err, sessionId: shortHash(this.session.id), userHash: shortHash(userId), pcmPath },
+            'recorder:stem missing after stop',
+          );
+        }
       }
       this.session.markParticipantLeft(userId);
     }
@@ -127,7 +185,11 @@ export class VoiceRecorder {
     }
 
     logger.info(
-      { sessionId: this.session.id, stems: stems.length, totalBytes: stems.reduce((a, b) => a + b.bytes, 0) },
+      {
+        sessionId: shortHash(this.session.id),
+        stems: stems.length,
+        totalBytes: stems.reduce((a, b) => a + b.bytes, 0),
+      },
       'recorder:stop',
     );
 

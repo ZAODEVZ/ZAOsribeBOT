@@ -1,17 +1,26 @@
 import {
+  ActivityType,
   ApplicationCommandOptionType,
   type ChatInputCommandInteraction,
+  ChannelType,
   type Client,
   Events,
   type GuildMember,
 } from 'discord.js';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
-import { notifyTranscribeWebhook, postprocessSession } from '../postprocess.js';
+import {
+  cleanupSessionFolder,
+  notifyTranscribeWebhook,
+  postprocessSession,
+} from '../postprocess.js';
 import { VoiceRecorder } from '../recorder.js';
 import { RecordingSession } from '../session.js';
+import { shortHash } from '../util/hash.js';
 
 const activeSessions = new Map<string, { recorder: VoiceRecorder; session: RecordingSession }>();
+const recentStops = new Map<string, number>();
+const START_COOLDOWN_MS = 5_000;
 
 export const SLASH_COMMANDS = [
   {
@@ -45,10 +54,52 @@ export const SLASH_COMMANDS = [
   },
 ] as const;
 
+/**
+ * Fail-closed authorization. Empty allowlist = no one. The deployer MUST
+ * populate DISCORD_ADMIN_USER_IDS before recording works. This is a privacy
+ * decision: an unconfigured bot must not record voice.
+ */
 function isAuthorized(member: GuildMember | null): boolean {
-  if (config.discord.adminUserIds.length === 0) return true;
+  if (config.discord.adminUserIds.length === 0) return false;
   if (!member) return false;
   return config.discord.adminUserIds.includes(member.id);
+}
+
+async function setRecordingPresence(client: Client, channelName: string | null): Promise<void> {
+  try {
+    if (channelName) {
+      client.user?.setPresence({
+        activities: [{ name: `Recording #${channelName}`, type: ActivityType.Watching }],
+        status: 'online',
+      });
+    } else {
+      client.user?.setPresence({ activities: [], status: 'online' });
+    }
+  } catch (err) {
+    logger.warn({ err }, 'discord:presence update failed');
+  }
+}
+
+async function postChannelConsentBanner(
+  interaction: ChatInputCommandInteraction,
+  channelName: string,
+  starterMention: string,
+): Promise<void> {
+  // Public message to the *text* channel where the slash command was used so
+  // everyone (including people who join the voice channel later) can scroll
+  // back and see that recording is active. Best-effort.
+  try {
+    const channel = interaction.channel;
+    if (channel && 'send' in channel && channel.type !== ChannelType.GuildStageVoice) {
+      await channel.send(
+        `**Recording active** in voice channel **${channelName}** - started by ${starterMention}. ` +
+          'All participants are being recorded for meeting capture. ' +
+          'Leave the voice channel if you do not consent. Run `/scribe stop` to end.',
+      );
+    }
+  } catch (err) {
+    logger.warn({ err }, 'discord:consent-banner post failed');
+  }
 }
 
 async function handleStart(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -58,7 +109,13 @@ async function handleStart(interaction: ChatInputCommandInteraction): Promise<vo
   }
   const member = await interaction.guild.members.fetch(interaction.user.id);
   if (!isAuthorized(member)) {
-    await interaction.reply({ content: 'You are not authorized to start ZAOscribe.', ephemeral: true });
+    await interaction.reply({
+      content:
+        config.discord.adminUserIds.length === 0
+          ? 'ZAOscribe has no admins configured. The deployer must set `DISCORD_ADMIN_USER_IDS` before recording is allowed.'
+          : 'You are not authorized to start ZAOscribe.',
+      ephemeral: true,
+    });
     return;
   }
 
@@ -79,6 +136,16 @@ async function handleStart(interaction: ChatInputCommandInteraction): Promise<vo
     return;
   }
 
+  const lastStop = recentStops.get(interaction.guild.id);
+  if (lastStop && Date.now() - lastStop < START_COOLDOWN_MS) {
+    const wait = Math.ceil((START_COOLDOWN_MS - (Date.now() - lastStop)) / 1000);
+    await interaction.reply({
+      content: `Cooldown active. Try again in ${wait}s.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
   await interaction.deferReply();
 
   const session = new RecordingSession({
@@ -94,9 +161,12 @@ async function handleStart(interaction: ChatInputCommandInteraction): Promise<vo
   await recorder.start();
   activeSessions.set(interaction.guild.id, { recorder, session });
 
+  await setRecordingPresence(interaction.client, channel.name);
+  await postChannelConsentBanner(interaction, channel.name, `<@${interaction.user.id}>`);
+
   await interaction.editReply(
-    `ZAOscribe is recording **${channel.name}**. Session id: \`${session.id}\`.\n` +
-      'Bot will capture per-speaker stems. Run `/scribe stop` when done.',
+    `ZAOscribe is recording **${channel.name}**.\n` +
+      `Session: \`${session.id}\`. Run \`/scribe stop\` when done.`,
   );
 }
 
@@ -125,21 +195,37 @@ async function handleStop(interaction: ChatInputCommandInteraction): Promise<voi
   const notes = interaction.options.getString('notes') ?? undefined;
   const { recorder, session } = active;
   activeSessions.delete(interaction.guild.id);
+  recentStops.set(interaction.guild.id, Date.now());
 
   const { stems } = await recorder.stop();
   await session.finalize(notes);
+  await setRecordingPresence(interaction.client, null);
 
   await interaction.editReply(
-    `Recording stopped. ${stems.length} stem(s) captured. Postprocessing + handoff to /meeting pipeline...`,
+    `Recording stopped. ${stems.length} stem(s) captured. Postprocessing...`,
   );
 
-  let { mixPath, stemWavs } = { mixPath: '', stemWavs: [] as string[] };
+  let mixPath = '';
+  let stemWavs: string[] = [];
+  let failedStems = 0;
+  let postprocessOk = true;
   try {
     const post = await postprocessSession(session);
     mixPath = post.mixPath;
     stemWavs = post.stemWavs;
+    failedStems = post.failedStems;
   } catch (err) {
-    logger.error({ err, sessionId: session.id }, 'discord:postprocess failed');
+    postprocessOk = false;
+    logger.error(
+      { err, sessionId: shortHash(session.id) },
+      'discord:postprocess threw unexpectedly',
+    );
+  }
+
+  // If postprocess failed AND we have no usable stems, scrub the folder so
+  // disk doesn't fill with broken sessions.
+  if (!postprocessOk && stemWavs.length === 0) {
+    await cleanupSessionFolder(session);
   }
 
   const webhookResult = await notifyTranscribeWebhook(
@@ -154,7 +240,7 @@ async function handleStop(interaction: ChatInputCommandInteraction): Promise<voi
       participants: Object.fromEntries(
         Object.entries(session.meta.participants).map(([uid, p]) => [
           uid,
-          { userId: p.userId, username: p.username, displayName: p.displayName },
+          { userId: p.userId, usernameHash: shortHash(p.username) },
         ]),
       ),
       startedAt: session.meta.startedAt,
@@ -165,9 +251,9 @@ async function handleStop(interaction: ChatInputCommandInteraction): Promise<voi
 
   const summaryLines = [
     `**Session** \`${session.id}\``,
-    `**Stems** ${stems.length} - mixed to \`${mixPath || 'n/a'}\``,
+    `**Stems** ${stems.length} captured${failedStems > 0 ? `, ${failedStems} failed encode` : ''} - mixed to \`${mixPath || 'n/a'}\``,
     `**Folder** \`${session.folder}\``,
-    `**Duration** ${session.meta.durationMs ? Math.round(session.meta.durationMs / 1000) + 's' : 'n/a'}`,
+    `**Duration** ${session.meta.durationMs ? `${Math.round(session.meta.durationMs / 1000)}s` : 'n/a'}`,
     `**Pipeline handoff** ${webhookResult.ok ? 'OK' : webhookResult.body ? `failed (${webhookResult.body})` : 'not configured'}`,
   ];
 

@@ -15,12 +15,14 @@ RestartSec=5s
 StandardOutput=journal
 StandardError=journal
 
-# Hardening
+# Hardening - app dir read-only, recordings live in /var/lib so disk usage is
+# observable + backup-policy-distinct from the code dir. Make sure
+# RECORDINGS_DIR in .env matches the ReadWritePaths below.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths=/opt/zaoscribe/recordings
+ReadWritePaths=/var/lib/zaoscribe
 
 [Install]
 WantedBy=multi-user.target
