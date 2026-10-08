@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      # build is tsc --noEmit; the bot entrypoint is never imported (it would connect to Discord).
+      - run: npm run build
+      # npm run lint (biome) is not run yet: the repo has no biome.json and the code
+      # was never formatted to biome defaults. Adding it is a separate format PR.
